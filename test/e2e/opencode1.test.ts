@@ -109,7 +109,7 @@ const api = (path: string, body?: unknown, signal?: AbortSignal) =>
  * answer it, while later requests go through. Each startup probe gets its own
  * deadline, so one dropped request cannot stall the setup.
  */
-const probe = (path: string) => api(path, undefined, AbortSignal.timeout(5000));
+const probe = (path: string, deadline: number) => api(path, undefined, AbortSignal.timeout(Math.max(1, Math.min(5000, deadline - Date.now()))));
 const serveErr = async () => (await Bun.file(join(root, "serve.err")).text().catch(() => "")).slice(-4000);
 const newSession = async () => ((await (await api("/session", {})).json()) as { id: string }).id;
 const say = (session: string, words: string) => api(`/session/${session}/message`, { parts: [{ type: "text", text: words }] });
@@ -168,15 +168,15 @@ beforeAll(async () => {
       AHP_HOOKS_FILE: registration,
     },
   });
-  const started = Date.now();
-  while (!(await probe("/session").then((response) => response.ok).catch(() => false))) {
+  const starting = Date.now() + 90000;
+  while (!(await probe("/session", starting).then((response) => response.ok).catch(() => false))) {
     if (server.exitCode !== null) throw new Error(`opencode exited with ${server.exitCode}; serve.err:\n${await serveErr()}`);
-    if (Date.now() - started > 90000) throw new Error(`opencode did not start in 90s; serve.err:\n${await serveErr()}`);
+    if (Date.now() >= starting) throw new Error(`opencode did not start in 90s; serve.err:\n${await serveErr()}`);
     await Bun.sleep(250);
   }
   // The MCP server connects in the background.
-  for (const connecting = Date.now(); Date.now() - connecting < 20000; await Bun.sleep(250)) {
-    const status = await probe("/mcp").then((response) => response.json()).catch(() => ({})) as { docs?: { status?: string } };
+  for (const connecting = Date.now() + 20000; Date.now() < connecting; await Bun.sleep(250)) {
+    const status = await probe("/mcp", connecting).then((response) => response.json()).catch(() => ({})) as { docs?: { status?: string } };
     if (status.docs?.status === "connected") break;
   }
 }, 120000);
