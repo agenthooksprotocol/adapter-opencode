@@ -97,12 +97,20 @@ const model = Bun.serve({
 
 let server: ReturnType<typeof Bun.spawn>;
 let base = "";
-const api = (path: string, body?: unknown) =>
+const api = (path: string, body?: unknown, signal?: AbortSignal) =>
   fetch(`${base}${path}${path.includes("?") ? "&" : "?"}directory=${encodeURIComponent(project)}`, {
     method: body === undefined ? "GET" : "POST",
     headers: { "content-type": "application/json" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    signal,
   });
+/**
+ * OpenCode 1.19.5 can accept a request in its first second up and never
+ * answer it, while later requests go through. Each startup probe gets its own
+ * deadline, so one dropped request cannot stall the setup.
+ */
+const probe = (path: string, deadline: number) => api(path, undefined, AbortSignal.timeout(Math.max(1, Math.min(5000, deadline - Date.now()))));
+const serveErr = async () => (await Bun.file(join(root, "serve.err")).text().catch(() => "")).slice(-4000);
 const newSession = async () => ((await (await api("/session", {})).json()) as { id: string }).id;
 const say = (session: string, words: string) => api(`/session/${session}/message`, { parts: [{ type: "text", text: words }] });
 const callTool = (session: string, tool: string, args: unknown) => say(session, `CALL ${tool} ${JSON.stringify(args)}`);
@@ -154,22 +162,24 @@ beforeAll(async () => {
       XDG_CACHE_HOME: join(home, ".cache"),
       XDG_STATE_HOME: join(home, ".local/state"),
       OPENCODE_DISABLE_AUTOUPDATE: "1",
+      // A cold start installs @opencode-ai/plugin into the config directory;
+      // a cache kept with the repo's dependencies saves the download next time.
+      npm_config_cache: join(REPO, "node_modules/.cache/opencode-e2e-npm"),
       AHP_HOOKS_FILE: registration,
     },
   });
-  for (let attempt = 0; ; attempt++) {
-    const up = await fetch(`${base}/session?directory=${encodeURIComponent(project)}`).then((response) => response.ok).catch(() => false);
-    if (up) break;
-    if (attempt > 240) throw new Error("opencode did not start");
+  const starting = Date.now() + 90000;
+  while (!(await probe("/session", starting).then((response) => response.ok).catch(() => false))) {
+    if (server.exitCode !== null) throw new Error(`opencode exited with ${server.exitCode}; serve.err:\n${await serveErr()}`);
+    if (Date.now() >= starting) throw new Error(`opencode did not start in 90s; serve.err:\n${await serveErr()}`);
     await Bun.sleep(250);
   }
   // The MCP server connects in the background.
-  for (let attempt = 0; attempt < 80; attempt++) {
-    const status = await api("/mcp").then((response) => response.json()).catch(() => ({})) as { docs?: { status?: string } };
+  for (const connecting = Date.now() + 20000; Date.now() < connecting; await Bun.sleep(250)) {
+    const status = await probe("/mcp", connecting).then((response) => response.json()).catch(() => ({})) as { docs?: { status?: string } };
     if (status.docs?.status === "connected") break;
-    await Bun.sleep(250);
   }
-});
+}, 120000);
 
 afterAll(async () => {
   server?.kill();

@@ -116,7 +116,10 @@ const project = join(root, "project");
 let server: ReturnType<typeof Bun.spawn>;
 let base = "";
 const headers = { "content-type": "application/json", authorization: `Basic ${btoa(`opencode:${PASSWORD}`)}` };
-const api = (method: string, path: string, body?: unknown) => fetch(`${base}${path}`, { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+const api = (method: string, path: string, body?: unknown, signal?: AbortSignal) => fetch(`${base}${path}`, { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal });
+/** A startup probe that gives up by its deadline, so one unanswered request cannot stall the setup. */
+const probe = (path: string, deadline: number) => api("GET", path, undefined, AbortSignal.timeout(Math.max(1, Math.min(5000, deadline - Date.now()))));
+const serveErr = async () => (await Bun.file(join(root, "serve.err")).text().catch(() => "")).slice(-4000);
 const newSession = async () => ((await (await api("POST", "/api/session", { location: { directory: project } })).json()) as { data: { id: string } }).data.id;
 const prompt = (session: string, words: string) => api("POST", `/api/session/${session}/prompt`, { text: words });
 const wait = (session: string) => api("POST", `/api/experimental/session/${session}/wait`);
@@ -181,19 +184,18 @@ describe.skipIf(!VERSION.startsWith("2."))(`OpenCode ${VERSION}`, () => {
         AHP_HOOKS_FILE: registration,
       },
     });
-    for (let attempt = 0; ; attempt++) {
-      const up = await api("GET", "/api/session").then((response) => response.ok).catch(() => false);
-      if (up) break;
-      if (attempt > 240) throw new Error("opencode did not start");
+    const starting = Date.now() + 90000;
+    while (!(await probe("/api/session", starting).then((response) => response.ok).catch(() => false))) {
+      if (server.exitCode !== null) throw new Error(`opencode exited with ${server.exitCode}; serve.err:\n${await serveErr()}`);
+      if (Date.now() >= starting) throw new Error(`opencode did not start in 90s; serve.err:\n${await serveErr()}`);
       await Bun.sleep(250);
     }
     // MCP servers connect in the background: their tools are there when listed.
-    for (let attempt = 0; attempt < 80; attempt++) {
-      const servers = await api("GET", `/api/mcp?directory=${encodeURIComponent(project)}`).then((response) => response.json()).catch(() => undefined) as { data?: { status?: { status?: string } }[] } | undefined;
+    for (const connecting = Date.now() + 20000; Date.now() < connecting; await Bun.sleep(250)) {
+      const servers = await probe(`/api/mcp?directory=${encodeURIComponent(project)}`, connecting).then((response) => response.json()).catch(() => undefined) as { data?: { status?: { status?: string } }[] } | undefined;
       if (servers?.data?.length === 2 && servers.data.every((server) => server.status?.status === "connected")) break;
-      await Bun.sleep(250);
     }
-  }, 90000);
+  }, 120000);
 
   afterAll(async () => {
     server?.kill();
